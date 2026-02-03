@@ -1,6 +1,10 @@
 bundle:
   name: "databricks-genie-slackbot"
 
+sync:
+  include:
+    - slackbot/app.yaml
+
 variables:
   app_name:
     description: "Name of the Slackbot Databricks App"
