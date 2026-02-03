@@ -35,7 +35,7 @@ For this project, you will need to first set up a Slackbot. Then, deploy the sla
 First clone this repository:
 
 ```
-git clone https://github.com/dqiu1206/databricks-genie-slackbot.git
+git clone https://github.com/dairyqiu/databricks-genie-slackbot.git
 ```
 
 ## Setting Up a Slackbot
@@ -135,7 +135,7 @@ databricks secrets put-secret <scope-name> SLACK_APP_TOKEN
 databricks secrets put-secret <scope-name> SLACK_BOT_TOKEN
 ```
 
-2. We will now need to set up our env variables in [app.yaml](app.yaml). Databricks Apps uses this file to know what commands to run as well as any env variables you want to inject.
+2. We will now need to set up our env variables in [slackbot/app.yaml](slackbot/app.yaml). Databricks Apps uses this file to know what commands to run as well as any env variables you want to inject.
 
 Replace the values under SECRET_SCOPE, GENIE_SPACE_ID, and SHOW_SQL_QUERY (optional)
 
@@ -153,24 +153,16 @@ env:
 
 1. Follow this [guide](https://docs.databricks.com/aws/en/dev-tools/databricks-apps/create-custom-app) to setup your App
 
-2. Create your app deployment file (app.yaml). Fill it out with your secrets scope name and Genie Space ID:
+2. Create your app deployment file. Fill it out with your secrets scope name and Genie Space ID:
 
 ```
-cp app.yaml.example app.yaml
+cp slackbot/app.yaml.example slackbot/app.yaml
 ```
 
-3. After it gets deployed, go to the parent directory of the app in the terminal and paste in the following 2 commands:
-
-Sync source files - you can copy this is in your Overview tab
+3. Deploy using Databricks Asset Bundles:
 
 ```
-databricks sync --watch . /Workspace/Users/david.qiu@databricks.com/databricks_apps/xxx/xxx
-```
-
-Deploy - under "Deploy to Databricks Apps"
-
-```
-databricks apps deploy slackbot-dq --source-code-path xxx
+databricks bundle deploy && databricks bundle run slackbot_app
 ```
 
 #### Congrats! Now, you should be able to message your Slackbot in Slack.
@@ -180,7 +172,7 @@ databricks apps deploy slackbot-dq --source-code-path xxx
 1. Create your env file:
 
 ```
-cp env.example .env
+cp slackbot/env.example slackbot/.env
 ```
 
 2. Fill out .env file with correct env variables. You will need to [generate a Personal Access Token (PAT)](https://docs.databricks.com/aws/en/dev-tools/auth/pat) in your Databricks workspace.
@@ -188,13 +180,13 @@ cp env.example .env
 3. Install packages - you should probably do this in a [virtual env](https://docs.astral.sh/uv/pip/environments/)
 
 ```
-pip install -r requirements.txt
+pip install -r slackbot/requirements.txt
 ```
 
 4. Deploy the app
 
 ```
-python app.py
+cd slackbot && python app.py
 ```
 
 #### Congrats! Now, you should be able to message your Slackbot in Slack.

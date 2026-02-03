@@ -1,0 +1,14 @@
+bundle:
+  name: "databricks-genie-slackbot"
+
+variables:
+  app_name:
+    description: "Name of the Slackbot Databricks App"
+    default: "databricks-genie-slackbot"
+
+resources:
+  apps:
+    slackbot_app:
+      name: "${var.app_name}"
+      description: "Databricks Genie Slack Bot"
+      source_code_path: "./slackbot"

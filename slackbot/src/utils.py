@@ -1866,10 +1866,8 @@ def main() -> None:
         initialize_clients(bot_state)
         logger.info("✅ Slackbot backend initialized successfully with performance enhancements")
         
-        # Start Flask app
-        port = int(os.environ.get('PORT', 8080))
-        logger.info(f"🌐 Starting enhanced Flask web server on port {port}...")
-        logger.info("   📈 Performance enhancements enabled:")
+        # Log performance enhancements
+        logger.info("📈 Performance enhancements enabled:")
         logger.info("   • Connection pooling with health checks")
         logger.info("   • Enhanced memory management")
         logger.info("   • Real-time performance monitoring")
@@ -1954,9 +1952,12 @@ def main() -> None:
         
         signal.signal(signal.SIGINT, signal_handler)
         signal.signal(signal.SIGTERM, signal_handler)
-        
-        from .routes import app
-        app.run(debug=False, host='0.0.0.0', port=port)
+
+        # Keep main thread alive - Socket Mode runs in background thread
+        # Flask is not needed for Socket Mode (WebSocket-based communication)
+        logger.info("✅ All services started. Keeping main thread alive...")
+        while True:
+            time.sleep(60)
         
     except Exception as e:
         logger.error(f"❌ Failed to start enhanced Slackbot backend: {e}")

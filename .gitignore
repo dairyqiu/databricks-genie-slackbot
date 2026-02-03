@@ -1,7 +1,7 @@
 .databricks
 .venv
-slackbot/__pycache__/
-slackbot/.databricks
+__pycache__/
+*.pyc
 .vscode
-.env
-app.yaml
+# .env
+slackbot/app.yaml
