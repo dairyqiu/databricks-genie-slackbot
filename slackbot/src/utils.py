@@ -6,6 +6,7 @@ that doesn't fit into the other specialized modules.
 """
 
 import os
+import re
 import time
 import csv
 import io
@@ -36,6 +37,27 @@ from .databricks_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def sanitize_error_for_user(error_message: str) -> str:
+    """Remove sensitive info from error messages shown to users."""
+    sanitized = error_message
+    # Redact SQL queries (SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER)
+    sanitized = re.sub(
+        r'\b(SELECT|INSERT|UPDATE|DELETE|CREATE|DROP|ALTER)\s+.*?(?:FROM|INTO|SET|WHERE|VALUES|TABLE|;|\Z)',
+        '[SQL REDACTED]',
+        sanitized,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    # Redact three-part table/schema references (catalog.schema.table)
+    sanitized = re.sub(r'\b\w+\.\w+\.\w+\b', '[TABLE REDACTED]', sanitized)
+    # Redact two-part schema.table references
+    sanitized = re.sub(r'\b(?:FROM|JOIN|INTO|UPDATE)\s+\w+\.\w+\b', '[TABLE REDACTED]', sanitized, flags=re.IGNORECASE)
+    # Redact connection strings and URLs
+    sanitized = re.sub(r'(jdbc:|https?://|wss?://)[^\s\'"]+', '[URL REDACTED]', sanitized)
+    # Redact potential tokens/keys (strings that look like API keys or tokens)
+    sanitized = re.sub(r'\b[A-Za-z0-9_-]{20,}\b', '[TOKEN REDACTED]', sanitized)
+    return sanitized
 
 
 @dataclass
@@ -140,138 +162,95 @@ class QueuedRequest:
 
 @dataclass
 class ThrottleMetrics:
-    """Enhanced metrics for throttling operations."""
+    """Metrics for request tracking (no rate limiting)."""
     total_requests: int = 0
     allowed_requests: int = 0
-    rate_limited_requests: int = 0
-    queued_requests: int = 0
     queue_full_rejections: int = 0
     queue_timeouts: int = 0
     current_queue_depth: int = 0
     avg_queue_wait_time: float = 0.0
-    rate_limit_utilization: float = 0.0
     last_updated: datetime = field(default_factory=datetime.now)
 
 
-class GenieRateLimiter:
-    """Sliding window rate limiter for Genie API calls."""
-    
-    def __init__(self, rate_limit_per_minute: int = Config.GENIE_RATE_LIMIT_PER_MINUTE,
-                 window_size: int = Config.GENIE_RATE_LIMIT_WINDOW_SIZE,
-                 burst_capacity: int = Config.GENIE_BURST_CAPACITY):
-        self.rate_limit = rate_limit_per_minute
-        self.window_size = window_size
-        self.burst_capacity = burst_capacity
+class SimpleRequestTracker:
+    """Simple request tracker without rate limiting (QPM not enforced by Databricks)."""
+
+    def __init__(self):
         self.requests = deque()
         self.lock = RLock()
-        
-        logger.info(f"Initialized GenieRateLimiter: {rate_limit_per_minute} QPM, {window_size}s window, {burst_capacity} burst capacity")
-    
+        self.window_size = 60  # Track requests in the last 60 seconds for metrics only
+
+        logger.info("Initialized SimpleRequestTracker (no QPM rate limiting)")
+
     def can_proceed(self) -> bool:
-        """Check if a request can proceed without violating rate limits."""
-        with self.lock:
-            current_time = time.time()
-            self._cleanup_old_requests(current_time)
-            
-            # Check if we're under the rate limit
-            current_count = len(self.requests)
-            if current_count < self.rate_limit:
-                return True
-            
-            # Check if we can use burst capacity
-            if current_count < self.rate_limit + self.burst_capacity:
-                # Allow burst if the rate over the last 30 seconds is reasonable
-                recent_count = sum(1 for req_time in self.requests 
-                                 if current_time - req_time <= 30)
-                if recent_count < self.rate_limit // 2:
-                    return True
-            
-            return False
-    
+        """Always allow requests to proceed - no rate limiting."""
+        return True
+
     def record_request(self) -> bool:
-        """Record a request if it's allowed by rate limits."""
+        """Record a request for metrics tracking."""
         with self.lock:
-            if self.can_proceed():
-                self.requests.append(time.time())
-                return True
-            return False
-    
+            self.requests.append(time.time())
+            self._cleanup_old_requests(time.time())
+            return True
+
     def get_utilization(self) -> float:
-        """Get current rate limit utilization as a percentage."""
+        """Get request rate as requests per minute (for monitoring only)."""
         with self.lock:
             current_time = time.time()
             self._cleanup_old_requests(current_time)
-            return min((len(self.requests) / self.rate_limit) * 100, 100.0)
-    
+            return len(self.requests)  # Return count, not percentage
+
     def get_time_until_next_slot(self) -> float:
-        """Get estimated time until next request slot is available."""
-        with self.lock:
-            if self.can_proceed():
-                return 0.0
-            
-            if not self.requests:
-                return 0.0
-            
-            # Time until oldest request expires
-            oldest_request = self.requests[0]
-            return max(0.0, self.window_size - (time.time() - oldest_request))
-    
+        """Always return 0 - no rate limiting."""
+        return 0.0
+
     def _cleanup_old_requests(self, current_time: float) -> None:
-        """Remove requests outside the sliding window."""
+        """Remove requests outside the tracking window."""
         cutoff_time = current_time - self.window_size
         while self.requests and self.requests[0] < cutoff_time:
             self.requests.popleft()
 
 
 class WorkspaceThrottleManager:
-    """Coordinates all throttling layers for the workspace."""
-    
+    """Coordinates request queuing for the workspace (no QPM rate limiting)."""
+
     def __init__(self):
-        self.rate_limiter = GenieRateLimiter()
+        self.rate_limiter = SimpleRequestTracker()  # For metrics only, no actual limiting
         self.request_queue = deque()
         self.queue_lock = RLock()
         self.metrics = ThrottleMetrics()
         self.metrics_lock = RLock()
         self.processing_thread = None
         self.shutdown_event = threading.Event()
-        
+
         # Start background queue processor
         self._start_queue_processor()
-        
-        logger.info("Initialized WorkspaceThrottleManager with enhanced throttling")
+
+        logger.info("Initialized WorkspaceThrottleManager (no QPM rate limiting)")
     
-    def submit_request(self, user_id: str, request_callable, 
+    def submit_request(self, user_id: str, request_callable,
                       request_args: Tuple = (), request_kwargs: Dict = None,
                       priority: int = 0, timeout: float = Config.GENIE_QUEUE_TIMEOUT) -> Tuple[ThrottleStatus, Any]:
-        """Submit a request through the throttling system."""
+        """Submit a request (no rate limiting - processes immediately if queue is empty)."""
         if request_kwargs is None:
             request_kwargs = {}
-            
+
         request_id = f"{user_id}_{int(time.time() * 1000)}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}"
-        
+
         with self.metrics_lock:
             self.metrics.total_requests += 1
-        
-        # Check if we can proceed immediately
-        if self.rate_limiter.can_proceed():
-            if self.rate_limiter.record_request():
-                with self.metrics_lock:
-                    self.metrics.allowed_requests += 1
-                
-                try:
-                    result = request_callable(*request_args, **request_kwargs)
-                    return ThrottleStatus.ALLOWED, result
-                except Exception as e:
-                    logger.error(f"Error executing immediate request: {e}")
-                    return ThrottleStatus.ALLOWED, None
-        
-        # Check queue capacity
-        with self.queue_lock:
-            if len(self.request_queue) >= Config.GENIE_QUEUE_MAX_SIZE:
-                with self.metrics_lock:
-                    self.metrics.queue_full_rejections += 1
-                logger.warning(f"Queue full, rejecting request from user {user_id}")
-                return ThrottleStatus.QUEUE_FULL, None
+
+        # Process immediately - no rate limiting
+        self.rate_limiter.record_request()  # For metrics tracking only
+        with self.metrics_lock:
+            self.metrics.allowed_requests += 1
+
+        try:
+            result = request_callable(*request_args, **request_kwargs)
+            return ThrottleStatus.ALLOWED, result
+        except Exception as e:
+            logger.error(f"Error executing request: {e}")
+            return ThrottleStatus.ALLOWED, None
         
         # Queue the request
         queued_request = QueuedRequest(
@@ -312,52 +291,31 @@ class WorkspaceThrottleManager:
         return self._wait_for_request_completion(queued_request)
     
     def get_queue_status(self, user_id: str) -> Dict[str, Any]:
-        """Get queue status for a specific user."""
+        """Get queue status for a specific user (simplified - no rate limiting)."""
         with self.queue_lock:
-            user_requests = [req for req in self.request_queue if req.user_id == user_id]
             queue_depth = len(self.request_queue)
-            
-        if not user_requests:
-            return {
-                'in_queue': False,
-                'position': 0,
-                'estimated_wait_time': 0,
-                'queue_depth': queue_depth
-            }
-        
-        # Get position of first user request
-        position = next(i for i, req in enumerate(self.request_queue) 
-                       if req.user_id == user_id) + 1
-        
-        # Estimate wait time based on current rate limit utilization
-        utilization = self.rate_limiter.get_utilization()
-        time_per_request = 60 / Config.GENIE_RATE_LIMIT_PER_MINUTE  # seconds per request
-        estimated_wait = position * time_per_request * (utilization / 100)
-        
+
         return {
-            'in_queue': True,
-            'position': position,
-            'estimated_wait_time': estimated_wait,
-            'queue_depth': queue_depth,
-            'requests_ahead': position - 1
+            'in_queue': False,
+            'position': 0,
+            'estimated_wait_time': 0,
+            'queue_depth': queue_depth
         }
     
     def get_metrics(self) -> Dict[str, Any]:
-        """Get current throttling metrics."""
+        """Get current request metrics (no rate limiting)."""
         with self.metrics_lock:
             with self.queue_lock:
                 self.metrics.current_queue_depth = len(self.request_queue)
-                self.metrics.rate_limit_utilization = self.rate_limiter.get_utilization()
-                
+                requests_per_minute = self.rate_limiter.get_utilization()
+
                 return {
                     'total_requests': self.metrics.total_requests,
                     'allowed_requests': self.metrics.allowed_requests,
-                    'rate_limited_requests': self.metrics.rate_limited_requests,
-                    'queued_requests': self.metrics.queued_requests,
+                    'requests_per_minute': requests_per_minute,  # Renamed from rate_limit_utilization
                     'queue_full_rejections': self.metrics.queue_full_rejections,
                     'queue_timeouts': self.metrics.queue_timeouts,
                     'current_queue_depth': self.metrics.current_queue_depth,
-                    'rate_limit_utilization': self.metrics.rate_limit_utilization,
                     'avg_queue_wait_time': self.metrics.avg_queue_wait_time,
                     'last_updated': self.metrics.last_updated.isoformat()
                 }
@@ -368,11 +326,11 @@ class WorkspaceThrottleManager:
             while not self.shutdown_event.is_set():
                 try:
                     self._process_next_request()
-                    time.sleep(Config.GENIE_THROTTLE_CHECK_INTERVAL)
+                    time.sleep(1)  # Check queue every second
                 except Exception as e:
                     logger.error(f"Error in queue processor: {e}")
                     time.sleep(5)  # Back off on error
-        
+
         self.processing_thread = threading.Thread(target=process_queue, daemon=True)
         self.processing_thread.start()
         logger.info("Started queue processor thread")
@@ -533,6 +491,9 @@ class BotState:
         self.client_id: Optional[str] = None
         self.client_secret: Optional[str] = None
         self.access_token: Optional[str] = None
+
+        # API key for endpoint authentication
+        self.api_key: Optional[str] = None
         
         # Performance optimizations
         self.performance_monitor = PerformanceMonitor()
@@ -569,6 +530,18 @@ class BotState:
         self.genie_rate_limiter = threading.Semaphore(Config.GENIE_MAX_CONCURRENT_CONVERSATIONS)
         self.genie_api_calls = []  # Track API call timestamps for rate limiting
         self.genie_calls_lock = RLock()  # Lock for thread-safe API call tracking
+
+        # Message ID tracking for feedback feature
+        self.message_id_tracker: Dict[str, Dict[str, str]] = {}  # slack_ts -> {conversation_id, message_id}
+        self.message_id_lock = RLock()
+
+    def __repr__(self) -> str:
+        """Prevent token/secret exposure in logs and debugging."""
+        return (
+            f"BotState(host={self.databricks_host}, "
+            f"space={self.genie_space_id}, "
+            f"conversations={len(self.conversation_tracker)})"
+        )
         
 
 
@@ -746,53 +719,23 @@ def get_user_queue_lock(user_id: str, bot_state) -> RLock:
 
 
 def add_message_to_queue(user_id: str, event: Dict[str, Any], say, client, bot_state) -> None:
-    """Process messages directly through the workspace throttle manager without user-based queuing."""
+    """Process messages directly (no rate limiting)."""
     try:
-        # Check workspace rate limits using throttle manager
-        rate_utilization = bot_state.throttle_manager.rate_limiter.get_utilization()
-        
-        if rate_utilization < 95:
-            # Process immediately - workspace has capacity
-            logger.info(f"🚀 Processing message immediately for user {user_id} (workspace load: {rate_utilization:.1f}%)")
-            try:
-                say(f"🤖 *Processing your request...*", thread_ts=event.get("ts"))
-            except Exception as e:
-                logger.error(f"Error sending processing message: {e}")
-            
-            # Submit directly to thread pool - let workspace throttle manager handle queuing if needed
-            bot_state.message_executor.submit(process_message_with_workspace_throttling, user_id, event, say, client, bot_state)
-        else:
-            # Workspace is near capacity - use workspace throttle manager for queuing
-            logger.info(f"📥 Submitting to workspace queue for user {user_id} (workspace load: {rate_utilization:.1f}%)")
-            try:
-                workspace_status = bot_state.throttle_manager.get_metrics()
-                queue_depth = workspace_status.get('current_queue_depth', 0)
-                avg_wait = workspace_status.get('avg_queue_wait_time', 0)
-                
-                if queue_depth > 0:
-                    say(f"⏳ *Request queued* - Workspace at {rate_utilization:.1f}% capacity\n"
-                        f"🔄 Queue depth: {queue_depth} requests\n"
-                        f"⏱️ Estimated wait: ~{avg_wait:.0f} seconds", 
-                        thread_ts=event.get("ts"))
-                else:
-                    say(f"⏳ *Request queued* - Processing shortly...", 
-                        thread_ts=event.get("ts"))
-            except Exception as e:
-                logger.error(f"Error sending queue status message: {e}")
-            
-            # Submit through workspace throttle manager
-            def process_request():
-                process_message_async(event, say, client, bot_state)
-            
-            bot_state.message_executor.submit(
-                lambda: bot_state.throttle_manager.submit_request(
-                    user_id, process_request
-                )
-            )
+        # Process immediately - no rate limiting
+        logger.info(f"🚀 Processing message for user {user_id}")
+        try:
+            say(f"🤖 *Processing your request...*", thread_ts=event.get("ts"))
+        except Exception as e:
+            logger.error(f"Error sending processing message: {e}")
+
+        # Submit directly to thread pool
+        bot_state.message_executor.submit(process_message_with_workspace_throttling, user_id, event, say, client, bot_state)
+
     except Exception as e:
         logger.error(f"Error in add_message_to_queue for user {user_id}: {e}")
         try:
-            say(f"❌ Sorry, I encountered an error: {str(e)}", thread_ts=event.get("ts"))
+            sanitized_error = sanitize_error_for_user(str(e))
+            say(f"❌ Sorry, I encountered an error: {sanitized_error}", thread_ts=event.get("ts"))
         except Exception as say_error:
             logger.error(f"Error sending error message: {say_error}")
 
@@ -804,7 +747,8 @@ def process_message_with_workspace_throttling(user_id: str, event: Dict[str, Any
     except Exception as e:
         logger.error(f"Error processing message for user {user_id}: {e}")
         try:
-            say(f"❌ Sorry, I encountered an error processing your message: {str(e)}", thread_ts=event.get("ts"))
+            sanitized_error = sanitize_error_for_user(str(e))
+            say(f"❌ Sorry, I encountered an error processing your message: {sanitized_error}", thread_ts=event.get("ts"))
         except Exception as say_error:
             logger.error(f"Error sending error message: {say_error}")
 
@@ -907,7 +851,7 @@ def handle_special_commands(message_content: str, channel_id: str, thread_ts: Op
             "💬 *Chat with Genie:* Just send any message to start a conversation!",
             "🔄 *Reset conversation:* Type `/reset` to start a fresh conversation",
             "📊 *Conversation status:* Type `/status` to see your current conversation",
-            "🚦 *System status:* Type `/throttle` to see current throttling status",
+            "🚦 *System status:* Type `/throttle` to see system metrics",
             "❓ *Get help:* Type `/help` to see this message",
             "",
             "💡 *Features:*",
@@ -915,12 +859,12 @@ def handle_special_commands(message_content: str, channel_id: str, thread_ts: Op
             "• **Context retention:** Genie remembers previous messages in threads",
             "• **Thread-based conversations:** Each Slack thread maintains its own conversation",
             "• **Automatic expiration:** Conversations expire after 1 hour of inactivity",
-            "• **Smart throttling:** System automatically manages API rate limits (5 QPM)",
+            "• **Feedback:** React with 👍 or 👎 to rate responses",
             "",
             "📊 *Query Results:*",
             "• Genie can generate and execute SQL queries",
             "• Results are provided as CSV files when available",
-            "• Large files may be too big for Slack upload",
+            "• Large results include a download link",
             "",
             "Need help? Contact your workspace administrator."
         ]
@@ -930,42 +874,26 @@ def handle_special_commands(message_content: str, channel_id: str, thread_ts: Op
     # Handle throttle status command
     if message_content_stripped in ['/throttle', 'throttle', 'system status', 'rate limit']:
         try:
-            throttling_metrics = bot_state.throttle_manager.get_metrics()
-            queue_status = bot_state.throttle_manager.get_queue_status(channel_id)  # Use channel as user proxy
-            time_until_slot = bot_state.throttle_manager.rate_limiter.get_time_until_next_slot()
-            
+            metrics = bot_state.throttle_manager.get_metrics()
+
             status_text = [
                 "🚦 *System Status:*",
-                f"• **Queue Depth:** {throttling_metrics.get('current_queue_depth', 0)} requests waiting",
-                f"• **Average Wait Time:** {throttling_metrics.get('avg_queue_wait_time', 0):.1f} seconds",
                 "",
                 "📈 *Request Statistics:*",
-                f"• **Total Requests:** {throttling_metrics.get('total_requests', 0)}",
-                f"• **Immediately Processed:** {throttling_metrics.get('allowed_requests', 0)}",
-                f"• **Queued and Processed:** {throttling_metrics.get('queued_requests', 0)}",
-                f"• **Queue Full Rejections:** {throttling_metrics.get('queue_full_rejections', 0)}",
-                f"• **Timeouts:** {throttling_metrics.get('queue_timeouts', 0)}",
+                f"• **Total Requests:** {metrics.get('total_requests', 0)}",
+                f"• **Processed:** {metrics.get('allowed_requests', 0)}",
+                f"• **Requests/min:** {metrics.get('requests_per_minute', 0):.0f}",
                 "",
-                f"⏱️ **Next Available Slot:** {time_until_slot:.0f} seconds" if time_until_slot > 0 else "✅ **Ready for requests**"
+                "✅ **Ready for requests** (no rate limiting)"
             ]
-            
-            if queue_status['in_queue']:
-                status_text.extend([
-                    "",
-                    "👤 *Your Status:*",
-                    f"• **Position in Queue:** #{queue_status['position']}",
-                    f"• **Estimated Wait Time:** ~{queue_status['estimated_wait_time']:.0f} seconds"
-                ])
-                
+
         except Exception as e:
-            logger.error(f"Error getting throttle status: {e}")
+            logger.error(f"Error getting status: {e}")
             status_text = [
-                "🚦 *System Throttling Status:*",
-                "• **Error retrieving status**",
-                "",
-                "💡 *Tip:* The system uses smart throttling to manage API rate limits (5 QPM)"
+                "🚦 *System Status:*",
+                "• **Error retrieving status**"
             ]
-        
+
         say("\n".join(status_text), thread_ts=message_ts)
         return True
     
@@ -1009,12 +937,24 @@ def handle_special_commands(message_content: str, channel_id: str, thread_ts: Op
     return False 
 
 
-def extract_message_content(message_result: Any) -> Tuple[List[str], Optional[Any], Optional[str]]:
-    """Extract text content and query attachment from message result."""
+def extract_message_content(message_result: Any) -> Tuple[List[str], Optional[Any], Optional[str], List[str]]:
+    """Extract text content, query attachment, and follow-up suggestions from message result.
+
+    Returns:
+        Tuple of (text_responses, query_attachment, attachment_id, followup_suggestions)
+    """
     genie_text_response = []
     genie_query_attachment = None
     attachment_id = None
-    
+    followup_suggestions = []
+
+    # Log all available fields for debugging
+    try:
+        available_attrs = [attr for attr in dir(message_result) if not attr.startswith('_')]
+        logger.debug(f"Message result available attributes: {available_attrs}")
+    except Exception:
+        pass
+
     # Try to get direct content first
     try:
         content = getattr(message_result, 'content', None)
@@ -1023,8 +963,8 @@ def extract_message_content(message_result: Any) -> Tuple[List[str], Optional[An
             genie_text_response.append(content)
     except (KeyError, AttributeError):
         pass
-    
-    # Process attachments
+
+    # Process attachments (including GenieSuggestedQuestionsAttachment for follow-up questions)
     try:
         attachments = getattr(message_result, 'attachments', None)
         if attachments:
@@ -1071,6 +1011,29 @@ def extract_message_content(message_result: Any) -> Tuple[List[str], Optional[An
                 except (KeyError, AttributeError):
                     pass
                 
+                # Handle GenieSuggestedQuestionsAttachment
+                try:
+                    suggested_questions_attr = getattr(attachment, 'suggested_questions', None)
+                    if suggested_questions_attr:
+                        logger.info(f"Found GenieSuggestedQuestionsAttachment")
+                        questions = getattr(suggested_questions_attr, 'questions', None)
+                        if questions:
+                            logger.info(f"Found {len(questions) if isinstance(questions, list) else 1} follow-up questions")
+                            if isinstance(questions, list):
+                                for q in questions:
+                                    if isinstance(q, str):
+                                        followup_suggestions.append(q)
+                                    elif hasattr(q, 'text'):
+                                        followup_suggestions.append(str(getattr(q, 'text')))
+                                    elif hasattr(q, 'question'):
+                                        followup_suggestions.append(str(getattr(q, 'question')))
+                                    else:
+                                        followup_suggestions.append(str(q))
+                            elif isinstance(questions, str):
+                                followup_suggestions.append(questions)
+                except (KeyError, AttributeError):
+                    pass
+
                 # Try alternative attachment types
                 try:
                     if hasattr(attachment, 'content') and not genie_text_response:
@@ -1098,8 +1061,20 @@ def extract_message_content(message_result: Any) -> Tuple[List[str], Optional[An
                     continue
         except Exception as e:
             logger.error(f"Error checking alternative content fields: {e}")
-    
-    return genie_text_response, genie_query_attachment, attachment_id
+
+    return genie_text_response, genie_query_attachment, attachment_id, followup_suggestions
+
+
+def format_followup_suggestions(suggestions: List[str]) -> str:
+    """Format follow-up suggestions for display in Slack."""
+    if not suggestions:
+        return ""
+
+    formatted = "\n\n💡 *Suggested follow-up questions:*"
+    for i, suggestion in enumerate(suggestions[:3], 1):  # Limit to 3 suggestions
+        formatted += f"\n• {suggestion}"
+
+    return formatted
 
 
 def format_query_summary(query_result: Any) -> str:
@@ -1206,26 +1181,32 @@ def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversa
             return "Error: Failed to get message response from Genie.", None, None, conv_id
 
         # Extract and process content
-        genie_text_response, genie_query_attachment, attachment_id = extract_message_content(message_result)
-        
+        genie_text_response, genie_query_attachment, attachment_id, followup_suggestions = extract_message_content(message_result)
+
         if genie_query_attachment:
             # Process query attachment
             result = process_query_attachment(
-                workspace_client, conv_id, message_id, attachment_id, 
-                genie_query_attachment, genie_text_response, bot_state
+                workspace_client, conv_id, message_id, attachment_id,
+                genie_query_attachment, genie_text_response, bot_state,
+                followup_suggestions
             )
         else:
             # Return text-only response
             response_text = ' '.join(genie_text_response) if genie_text_response else 'No response from Genie.'
-            
+
             # Clean up response - remove echoed input if it appears at the beginning
             if response_text.lower().startswith(msg_input.lower().strip()):
                 # Remove the echoed input and any following whitespace
                 cleaned_response = response_text[len(msg_input):].strip()
                 if cleaned_response:
                     response_text = cleaned_response
-            
-            result = f"Genie: {response_text}", None, None, conv_id
+
+            # Add follow-up suggestions if available
+            response_text = f"Genie: {response_text}"
+            if followup_suggestions:
+                response_text += format_followup_suggestions(followup_suggestions)
+
+            result = response_text, None, None, conv_id
         
         response_time = time.time() - start_time
         if bot_state and hasattr(bot_state, 'performance_monitor'):
@@ -1240,19 +1221,20 @@ def speak_with_genie(msg_input: str, workspace_client: WorkspaceClient, conversa
         return create_error_response(e, "Genie communication")
 
 
-def process_query_attachment(workspace_client: WorkspaceClient, conv_id: str, message_id: str, 
-                            attachment_id: Optional[str], query_attachment: Any, 
-                            genie_text_response: List[str], bot_state) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
+def process_query_attachment(workspace_client: WorkspaceClient, conv_id: str, message_id: str,
+                            attachment_id: Optional[str], query_attachment: Any,
+                            genie_text_response: List[str], bot_state,
+                            followup_suggestions: Optional[List[str]] = None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
     """Process query attachment with simplified execution."""
     try:
         logger.info(f"Processing query attachment")
-        
+
         # Execute query with fallback strategies
         query_result = execute_query_with_fallback(
-            workspace_client, str(bot_state.genie_space_id), conv_id, message_id, 
+            workspace_client, str(bot_state.genie_space_id), conv_id, message_id,
             attachment_id, query_attachment
         )
-        
+
         response_parts = []
         response_parts.append(f"Genie generated a query: {query_attachment.description}")
         
@@ -1302,12 +1284,29 @@ def process_query_attachment(workspace_client: WorkspaceClient, conv_id: str, me
                 size_str = f"{file_size_kb:.1f}KB"
             else:
                 size_str = f"{file_size_bytes}B"
-            
+
             if file_size_bytes > Config.SLACK_FILE_SIZE_LIMIT:
                 response_parts.append(f"📁 *File too large for Slack upload ({size_str})*")
-        
+                # Try to generate a download URL for large results
+                if attachment_id:
+                    try:
+                        from .databricks_client import get_large_result_download_url
+                        download_url = get_large_result_download_url(
+                            workspace_client, str(bot_state.genie_space_id),
+                            conv_id, message_id, attachment_id
+                        )
+                        if download_url:
+                            response_parts.append(f"🔗 *Download full results:* {download_url}")
+                            logger.info(f"Generated download URL for large result")
+                    except Exception as download_error:
+                        logger.warning(f"Could not generate download URL: {download_error}")
+
+        # Add follow-up suggestions if available
+        if followup_suggestions:
+            response_parts.append(format_followup_suggestions(followup_suggestions))
+
         return "\n\n".join(response_parts), csv_bytes, filename, conv_id
-        
+
     except Exception as e:
         logger.error(f"Error processing query attachment: {e}")
         # Fallback to text-only response if query results fail
@@ -1640,6 +1639,7 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
 
             
             # Get response from Genie using throttling system
+            genie_message_id = None
             try:
                 logger.info(f"🤖 Submitting Genie request through throttling system: {message_content[:50]}...")
                 status, result = submit_genie_request(
@@ -1649,12 +1649,12 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
                     request_args=(message_content, workspace_client, existing_conversation_id, bot_state),
                     priority=0
                 )
-                
+
                 if status == ThrottleStatus.ALLOWED:
-                    genie_response, csv_bytes, filename, conversation_id = result
+                    genie_response, csv_bytes, filename, conversation_id, genie_message_id = result
                     logger.info(f"✅ Received response from Genie, length: {len(genie_response) if genie_response else 0}")
                 elif status == ThrottleStatus.QUEUED:
-                    genie_response, csv_bytes, filename, conversation_id = result
+                    genie_response, csv_bytes, filename, conversation_id, genie_message_id = result
                     logger.info(f"✅ Received queued response from Genie, length: {len(genie_response) if genie_response else 0}")
                 elif status == ThrottleStatus.QUEUE_FULL:
                     genie_response = "⏳ System is busy. Please try again in a few moments."
@@ -1665,7 +1665,7 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
                 else:
                     genie_response = "❌ Rate limit exceeded. Please try again in a moment."
                     csv_bytes, filename, conversation_id = None, None, None
-                    
+
             except Exception as genie_error:
                 logger.error(f"Error in throttled Genie request: {genie_error}")
                 genie_response = f"❌ Sorry, I encountered an error while processing your request: {str(genie_error)}"
@@ -1689,9 +1689,32 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
         logger.info(f"   Response length: {len(genie_response)} characters")
         logger.info(f"   Response preview: {genie_response[:100]}{'...' if len(genie_response) > 100 else ''}")
         logger.info(f"   Reply thread_ts: {reply_thread_ts} (original thread_ts: {thread_ts}, message_ts: {message_ts})")
-        
-        say(genie_response, thread_ts=reply_thread_ts)
-        logger.info(f"✅ Response sent successfully to user {user_id}")
+
+        # Send message and capture the response timestamp for feedback tracking
+        try:
+            slack_response = client.chat_postMessage(
+                channel=channel_id,
+                text=genie_response,
+                thread_ts=reply_thread_ts
+            )
+            slack_message_ts = slack_response.get("ts")
+            logger.info(f"✅ Response sent successfully to user {user_id}, ts: {slack_message_ts}")
+
+            # Store message ID mapping for feedback tracking
+            if conversation_id and genie_message_id and slack_message_ts:
+                with bot_state.message_id_lock:
+                    bot_state.message_id_tracker[slack_message_ts] = {
+                        "conversation_id": conversation_id,
+                        "message_id": genie_message_id
+                    }
+                logger.debug(f"Stored message mapping: slack_ts={slack_message_ts} -> genie_msg={genie_message_id}")
+        except Exception as send_error:
+            logger.error(f"Error sending response to Slack: {send_error}")
+            say(genie_response, thread_ts=reply_thread_ts)  # Fallback to say
+
+        # Build feedback prompt if we have a tracked message
+        feedback_prompt = "_React with :+1: or :-1: to rate this response._" if (slack_message_ts and genie_message_id) else None
+        file_uploaded = False
 
         # Upload CSV file if available and within size limits
         if csv_bytes and filename:
@@ -1707,33 +1730,34 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
             else:
                 size_str = f"{file_size_bytes}B"
                 logger.info(f"Generated CSV file: {filename}, size: {file_size_bytes}B")
-            
+
             if file_size_bytes <= Config.SLACK_FILE_SIZE_LIMIT:
                 try:
                     logger.info(f"📁 Uploading CSV file to user {user_id}: {filename} ({size_str})")
-                    
-                    # Upload file to Slack - use proper thread timestamp
+
+                    # Upload file to Slack - include feedback prompt in initial_comment for deterministic ordering
                     response = client.files_upload_v2(
                         channel=event.get("channel"),
                         thread_ts=reply_thread_ts,
                         file=csv_bytes,
                         filename=filename,
                         title=f"Query Results - {filename}",
-                        initial_comment="📁 Here's your query results file:"
+                        initial_comment=feedback_prompt
                     )
                     logger.info(f"✅ Successfully uploaded file {filename} to user {user_id}")
-                    
-                    # Add a confirmation message
-                    say(f"✅ *File uploaded successfully!* {filename} ({size_str})", thread_ts=reply_thread_ts)
-                    
+                    file_uploaded = True
+
                 except Exception as upload_error:
                     logger.error(f"Error uploading file to Slack: {upload_error}")
-                    # If upload fails, provide error message
-                    say(f"📁 *File upload failed: {str(upload_error)}*", thread_ts=reply_thread_ts)
+                    say(f"File upload failed: {str(upload_error)}", thread_ts=reply_thread_ts)
             else:
                 # File too large, provide guidance
-                say(f"📁 *File too large for Slack ({size_str}). Please try a more specific query with LIMIT clause.*", thread_ts=reply_thread_ts)
-        
+                say(f"File too large for Slack ({size_str}). Try a more specific query with LIMIT.", thread_ts=reply_thread_ts)
+
+        # Send feedback prompt as separate message only if no file was uploaded
+        if feedback_prompt and not file_uploaded:
+            say(feedback_prompt, thread_ts=reply_thread_ts)
+
         # Mark this message as processed
         message_hash = hashlib.md5(message_content.encode()).hexdigest()[:8]
         message_key = (user_id, message_ts, message_hash)
@@ -1752,7 +1776,7 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
     except Exception as e:
         logger.error(f"❌ Error handling message from user {event.get('user', 'unknown')}: {e}")
         error_message = str(e)
-        
+
         # Provide more user-friendly error messages
         if "InterruptedIOException" in error_message:
             suggestions = [
@@ -1770,17 +1794,21 @@ def process_message_async(event: Dict[str, Any], say, client, bot_state) -> None
         elif "BAD_REQUEST" in error_message:
             say("❌ The query failed due to a bad request. This might be due to invalid SQL syntax or unsupported operations. Please check your query and try again.", thread_ts=event.get("ts"))
         elif "Query execution failed" in error_message:
-            say(f"❌ Query execution failed: {error_message}", thread_ts=event.get("ts"))
+            # Sanitize error message before displaying to user
+            sanitized_error = sanitize_error_for_user(error_message)
+            say(f"❌ Query execution failed: {sanitized_error}", thread_ts=event.get("ts"))
         else:
-            say(f"❌ Sorry, I encountered an error: {error_message}", thread_ts=event.get("ts"))
-        
+            # Sanitize error message before displaying to user
+            sanitized_error = sanitize_error_for_user(error_message)
+            say(f"❌ Sorry, I encountered an error: {sanitized_error}", thread_ts=event.get("ts"))
+
         logger.info(f"✅ Cleaned up processing state for user {event.get('user', 'unknown')} after error")
 
 
 def handle_genie_error(error: Exception, operation: str = "Genie operation") -> str:
     """Standardized error handling for Genie-related operations."""
     error_str = str(error).lower()
-    
+
     if "permission" in error_str or "access" in error_str or "forbidden" in error_str:
         return f"❌ Access denied: {operation} failed due to insufficient permissions. Please check your workspace configuration or contact your administrator."
     elif "timeout" in error_str or "interrupted" in error_str:
@@ -1792,7 +1820,9 @@ def handle_genie_error(error: Exception, operation: str = "Genie operation") -> 
     elif "quota" in error_str or "limit" in error_str:
         return f"📊 Resource limit: {operation} exceeded available resources. Please try again later or contact your administrator."
     else:
-        return f"❌ {operation} failed: {str(error)}"
+        # Sanitize the error message to remove sensitive information
+        sanitized_error = sanitize_error_for_user(str(error))
+        return f"❌ {operation} failed: {sanitized_error}"
 
 
 def create_error_response(error: Exception, context: str = "operation") -> Tuple[str, None, None, None]:
@@ -1907,20 +1937,13 @@ def main() -> None:
                         performance_metrics = bot_state.performance_monitor.get_metrics()
                         throttling_metrics = bot_state.throttle_manager.get_metrics()
                         
-                        logger.info(f"💓 Enhanced Heartbeat - Time: {datetime.now().isoformat()}")
+                        logger.info(f"💓 Heartbeat - Time: {datetime.now().isoformat()}")
                         logger.info(f"   📊 Performance - Avg Response: {performance_metrics.get('avg_response_time', 0):.2f}s, "
                                   f"Memory: {performance_metrics.get('memory_usage_mb', 0):.1f}MB, "
                                   f"Queries: {performance_metrics.get('query_count', 0)}")
-                        logger.info(f"   📨 Queue - Active Users: {active_user_queues}, "
-                                  f"Messages: {total_queued_messages}, "
-                                  f"Processing Users: {len(bot_state.processing_users)}")
-                        logger.info(f"   🚦 Throttling - Rate Limit: {throttling_metrics.get('rate_limit_utilization', 0):.1f}%, "
-                                  f"Queue Depth: {throttling_metrics.get('current_queue_depth', 0)}, "
-                                  f"Avg Wait: {throttling_metrics.get('avg_queue_wait_time', 0):.1f}s")
-                        logger.info(f"   📈 Throttling Stats - Total: {throttling_metrics.get('total_requests', 0)}, "
-                                  f"Allowed: {throttling_metrics.get('allowed_requests', 0)}, "
-                                  f"Queued: {throttling_metrics.get('queued_requests', 0)}, "
-                                  f"Rejected: {throttling_metrics.get('queue_full_rejections', 0)}")
+                        logger.info(f"   📈 Requests - Total: {throttling_metrics.get('total_requests', 0)}, "
+                                  f"Processed: {throttling_metrics.get('allowed_requests', 0)}, "
+                                  f"RPM: {throttling_metrics.get('requests_per_minute', 0):.0f}")
                         logger.info(f"   💬 Conversations: {len(bot_state.conversation_tracker)}")
 
                     except Exception as heartbeat_error:
@@ -1985,7 +2008,8 @@ def extract_conversation_id_from_message(message_result: Any) -> Optional[str]:
 
 def process_query_attachment_optimized(workspace_client: WorkspaceClient, conv_id: str, message_result: Any,
                                      attachment_id: Optional[str], query_attachment: Any,
-                                     genie_text_response: List[str], bot_state) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
+                                     genie_text_response: List[str], bot_state,
+                                     followup_suggestions: Optional[List[str]] = None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
     """Process query attachment using SDK best practices."""
     try:
         logger.info("Processing query attachment with SDK optimizations")
@@ -2013,13 +2037,32 @@ def process_query_attachment_optimized(workspace_client: WorkspaceClient, conv_i
         # Handle query result if available
         if query_result:
             response_parts.append("✅ Query executed successfully")
-            
+
             # Create CSV file from query results
             csv_bytes, filename, _ = create_csv_from_query_results(query_result, workspace_client, query_attachment.query)
-            
+
             # Add preview of results to text response
             preview_text = format_query_results(query_result, workspace_client)
             response_parts.append(preview_text)
+
+            # Handle large files
+            if csv_bytes:
+                file_size_bytes = len(csv_bytes)
+                if file_size_bytes > Config.SLACK_FILE_SIZE_LIMIT:
+                    file_size_mb = file_size_bytes / (1024 * 1024)
+                    response_parts.append(f"📁 *File too large for Slack upload ({file_size_mb:.1f}MB)*")
+                    # Try to generate a download URL for large results
+                    if attachment_id:
+                        try:
+                            from .databricks_client import get_large_result_download_url
+                            download_url = get_large_result_download_url(
+                                workspace_client, str(bot_state.genie_space_id),
+                                conv_id, message_id, attachment_id
+                            )
+                            if download_url:
+                                response_parts.append(f"🔗 *Download full results:* {download_url}")
+                        except Exception as download_error:
+                            logger.warning(f"Could not generate download URL: {download_error}")
         else:
             # No query results available - provide guidance
             csv_bytes, filename = None, None
@@ -2032,9 +2075,13 @@ def process_query_attachment_optimized(workspace_client: WorkspaceClient, conv_i
                 "• Query complexity or timeout",
                 "• Contact your workspace administrator if needed"
             ])
-        
+
+        # Add follow-up suggestions if available
+        if followup_suggestions:
+            response_parts.append(format_followup_suggestions(followup_suggestions))
+
         return "\n\n".join(response_parts), csv_bytes, filename, conv_id
-        
+
     except Exception as e:
         logger.error(f"Error processing optimized query attachment: {e}")
         # Fallback to text-only response
@@ -2049,15 +2096,20 @@ def process_query_attachment_optimized(workspace_client: WorkspaceClient, conv_i
         return "\n\n".join(response_parts), None, None, conv_id
 
 
-def speak_with_genie_optimized(msg_input: str, workspace_client: WorkspaceClient, conversation_id: Optional[str] = None, bot_state=None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str]]:
-    """Optimized Genie interaction using SDK best practices and built-in waiters."""
+def speak_with_genie_optimized(msg_input: str, workspace_client: WorkspaceClient, conversation_id: Optional[str] = None, bot_state=None) -> Tuple[str, Optional[bytes], Optional[str], Optional[str], Optional[str]]:
+    """Optimized Genie interaction using SDK best practices and built-in waiters.
+
+    Returns:
+        Tuple of (response_text, csv_bytes, filename, conversation_id, message_id)
+    """
     start_time = time.time()
-    
+
     try:
         logger.info(f"Processing query with SDK waiters: {msg_input[:50]}...")
-        
+
         # Rate limiting is now handled by WorkspaceThrottleManager before this function is called
-        
+        message_id = None
+
         # Use SDK's built-in waiters instead of custom polling
         try:
             if conversation_id:
@@ -2080,60 +2132,75 @@ def speak_with_genie_optimized(msg_input: str, workspace_client: WorkspaceClient
                 )
                 # Extract conversation ID from the message result
                 conv_id = extract_conversation_id_from_message(message_result)
-        
+
+            # Extract message ID for feedback tracking
+            if message_result:
+                message_id = getattr(message_result, 'id', None)
+                if not message_id:
+                    message_id = getattr(message_result, 'message_id', None)
+                logger.debug(f"Extracted message_id: {message_id} for feedback tracking")
+
         except PermissionDenied as e:
             logger.error(f"Permission denied: {e}")
-            return f"❌ Access denied: {e}", None, None, conversation_id
+            return f"❌ Access denied: {e}", None, None, conversation_id, None
         except ResourceDoesNotExist as e:
             logger.error(f"Resource not found: {e}")
-            return f"❌ Genie space not found: {e}", None, None, conversation_id
+            return f"❌ Genie space not found: {e}", None, None, conversation_id, None
         except BadRequest as e:
             logger.error(f"Bad request: {e}")
-            return f"❌ Invalid request: {e}", None, None, conversation_id
+            return f"❌ Invalid request: {e}", None, None, conversation_id, None
         except TooManyRequests as e:
             logger.warning(f"Genie API rate limit exceeded, will be retried by throttle manager: {e}")
-            # Instead of returning an error, raise the exception so the throttle manager 
+            # Instead of returning an error, raise the exception so the throttle manager
             # can catch it and re-queue the request with backoff
             raise GenieRateLimitExceeded(f"Genie API rate limit exceeded: {e}") from e
         except InternalError as e:
             logger.error(f"Internal error: {e}")
-            return f"❌ Databricks service temporarily unavailable: {e}", None, None, conversation_id
-        
+            return f"❌ Databricks service temporarily unavailable: {e}", None, None, conversation_id, None
+
         if not message_result:
-            return "Error: Failed to get message response from Genie.", None, None, conv_id
+            return "Error: Failed to get message response from Genie.", None, None, conv_id, None
 
         # Extract and process content using existing logic
-        genie_text_response, genie_query_attachment, attachment_id = extract_message_content(message_result)
-        
+        genie_text_response, genie_query_attachment, attachment_id, followup_suggestions = extract_message_content(message_result)
+
         if genie_query_attachment:
             # Process query attachment with SDK best practices
-            result = process_query_attachment_optimized(
-                workspace_client, conv_id, message_result, attachment_id, 
-                genie_query_attachment, genie_text_response, bot_state
+            response_text, csv_bytes, filename, conv_id = process_query_attachment_optimized(
+                workspace_client, conv_id, message_result, attachment_id,
+                genie_query_attachment, genie_text_response, bot_state,
+                followup_suggestions
             )
+            result = response_text, csv_bytes, filename, conv_id, message_id
         else:
             # Return text-only response
             response_text = ' '.join(genie_text_response) if genie_text_response else 'No response from Genie.'
-            
+
             # Clean up response - remove echoed input if it appears at the beginning
             if response_text.lower().startswith(msg_input.lower().strip()):
                 cleaned_response = response_text[len(msg_input):].strip()
                 if cleaned_response:
                     response_text = cleaned_response
-            
-            result = f"Genie: {response_text}", None, None, conv_id
-        
+
+            # Add follow-up suggestions if available
+            response_text = f"Genie: {response_text}"
+            if followup_suggestions:
+                response_text += format_followup_suggestions(followup_suggestions)
+
+            result = response_text, None, None, conv_id, message_id
+
         response_time = time.time() - start_time
         if bot_state and hasattr(bot_state, 'performance_monitor'):
             bot_state.performance_monitor.record_query(response_time, success=True)
         return result
-        
+
     except Exception as e:
         logger.error(f"Error in optimized Genie communication: {e}")
         response_time = time.time() - start_time
         if bot_state and hasattr(bot_state, 'performance_monitor'):
             bot_state.performance_monitor.record_query(response_time, success=False)
-        return create_error_response(e, "Genie communication")
+        error_response = create_error_response(e, "Genie communication")
+        return error_response[0], error_response[1], error_response[2], error_response[3], None
 
 
 if __name__ == '__main__':

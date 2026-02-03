@@ -58,21 +58,15 @@ class Config:
     ]
     
     
-    # Databricks Genie API limits (aligned with documentation: 5 QPM for API usage)
+    # Databricks Genie API limits
     GENIE_MAX_CONCURRENT_CONVERSATIONS = 10  # Per workspace limit
-    GENIE_RATE_LIMIT_PER_MINUTE = 5  # 5 QPM per workspace (API usage, as documented)
-    GENIE_BURST_CAPACITY = 0  # No burst capacity - strict 5 QPM limit to match Genie API
     GENIE_MESSAGE_TIMEOUT = 600  # 10 minutes for long-running queries
     GENIE_POLL_INTERVAL = 7  # Poll every 7 seconds (between 5-10s as recommended)
     GENIE_BACKOFF_THRESHOLD = 120  # Start exponential backoff after 2 minutes
-    
-    # Enhanced throttling system configuration
+
+    # Queue configuration (simplified - no QPM rate limiting)
     GENIE_QUEUE_MAX_SIZE = 50  # Maximum number of queued requests per workspace
     GENIE_QUEUE_TIMEOUT = 300  # 5 minutes max wait time in queue
-    GENIE_RATE_LIMIT_WINDOW_SIZE = 60  # Sliding window size in seconds
-    GENIE_THROTTLE_CHECK_INTERVAL = 1  # Check rate limits every second
-    
-    # No user-based concurrency limits - only workspace QPM limits apply
 
 
 class ConfigurationError(Exception):
@@ -173,8 +167,40 @@ def load_configuration(bot_state) -> None:
     # Load SQL query display flag
     show_query_env = os.getenv('SHOW_SQL_QUERY', 'true')
     bot_state.show_sql_query = show_query_env.lower() in ('true', '1', 'yes', 'on')
-    
+
+    # Load API key for endpoint authentication
+    if is_local_deployment:
+        bot_state.api_key = os.getenv('API_KEY')
+    else:
+        bot_state.api_key = load_secret(secret_scope, "API_KEY", bot_state.dbutils, bot_state.workspace_client) or os.getenv('API_KEY')
+
+    if bot_state.api_key:
+        logger.info("API key configured for endpoint authentication")
+    else:
+        logger.warning("No API key configured - API endpoints will be unprotected")
+
     logger.info(f"Configuration loaded - SHOW_SQL_QUERY: {bot_state.show_sql_query}")
+
+    # Diagnostic: Verify Genie permissions at startup
+    logger.info("=" * 60)
+    logger.info("DIAGNOSTIC: Verifying Genie permissions...")
+    logger.info(f"DIAGNOSTIC: Service Principal Client ID: {app_client_id}")
+    logger.info(f"DIAGNOSTIC: Genie Space ID: {bot_state.genie_space_id}")
+
+    from .databricks_client import verify_genie_permissions
+    perm_results = verify_genie_permissions(bot_state.workspace_client, bot_state.genie_space_id)
+
+    logger.info(f"DIAGNOSTIC: Authenticated as: {perm_results['authenticated_user']}")
+    logger.info(f"DIAGNOSTIC: Genie space accessible: {perm_results['genie_space_accessible']}")
+    logger.info(f"DIAGNOSTIC: Genie space details: {perm_results['genie_space_details']}")
+    logger.info(f"DIAGNOSTIC: Warehouses accessible: {perm_results['warehouses_accessible']}")
+    logger.info(f"DIAGNOSTIC: Warehouse count: {perm_results['warehouse_count']}")
+
+    if perm_results['errors']:
+        for error in perm_results['errors']:
+            logger.error(f"DIAGNOSTIC ERROR: {error}")
+
+    logger.info("=" * 60)
 
 
 def validate_environment(bot_state) -> None:

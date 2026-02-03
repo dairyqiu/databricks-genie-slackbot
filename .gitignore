@@ -4,4 +4,4 @@ __pycache__/
 *.pyc
 .vscode
 # .env
-slackbot/app.yaml
+# slackbot/app.yaml

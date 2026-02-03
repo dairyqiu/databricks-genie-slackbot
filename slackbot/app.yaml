@@ -1,0 +1,12 @@
+command:
+  - python
+  - app.py
+
+# Environment variables
+env:
+  - name: "SECRET_SCOPE"
+    value: "slackbot-4"
+  - name: "GENIE_SPACE_ID"
+    value: "01f101241d04157fb8c20f34f1b24298"
+  - name: "SHOW_SQL_QUERY"
+    value: "true"

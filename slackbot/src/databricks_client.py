@@ -254,18 +254,20 @@ def execute_query_with_fallback(workspace_client: WorkspaceClient, space_id: str
         except Exception as e:
             logger.warning(f"Failed to get results by attachment: {e}")
     
-    # Try Genie's execute method
-    logger.info("Attempting to execute query using Genie's execute method...")
-    try:
-        query_result = workspace_client.genie.execute_message_query(
-            space_id=space_id,
-            conversation_id=conversation_id,
-            message_id=message_id
-        )
-        logger.info("Successfully executed query using Genie's default warehouse")
-        return query_result
-    except Exception as genie_exec_error:
-        logger.warning(f"Genie execute method failed: {genie_exec_error}")
+    # Try Genie's execute method using the preferred attachment-based API
+    if attachment_id:
+        logger.info("Attempting to execute query using execute_message_attachment_query...")
+        try:
+            query_result = workspace_client.genie.execute_message_attachment_query(
+                space_id=space_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                attachment_id=attachment_id
+            )
+            logger.info("Successfully executed query using attachment-based API")
+            return query_result
+        except Exception as attachment_exec_error:
+            logger.warning(f"Attachment-based execute method failed: {attachment_exec_error}")
     
     # Fall back to direct warehouse execution
     logger.info("Falling back to direct warehouse execution...")
@@ -333,7 +335,7 @@ def safe_extract_id(response: Any, id_fields: List[str] = None) -> Optional[str]
     """Safely extract ID from response using multiple possible field names."""
     if id_fields is None:
         id_fields = ['id', 'message_id', 'conversation_id']
-    
+
     for field in id_fields:
         try:
             value = getattr(response, field, None)
@@ -341,5 +343,108 @@ def safe_extract_id(response: Any, id_fields: List[str] = None) -> Optional[str]
                 return str(value)
         except Exception:
             continue
-    
-    return None 
+
+    return None
+
+
+def send_genie_feedback(workspace_client: WorkspaceClient, space_id: str,
+                       conversation_id: str, message_id: str, is_positive: bool) -> bool:
+    """Send user feedback to Genie for a specific message."""
+    try:
+        from databricks.sdk.service.dashboards import FeedbackRating
+        rating = FeedbackRating.POSITIVE if is_positive else FeedbackRating.NEGATIVE
+
+        logger.info(f"📤 Sending feedback to Genie API: space_id={space_id}, conversation_id={conversation_id}, message_id={message_id}, rating={rating}")
+        workspace_client.genie.send_message_feedback(
+            space_id=space_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            rating=rating
+        )
+        logger.info(f"✅ Successfully sent {'positive' if is_positive else 'negative'} feedback for message {message_id}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Failed to send feedback for message {message_id}: {e}")
+        return False
+
+
+def verify_genie_permissions(workspace_client: WorkspaceClient, space_id: str) -> Dict[str, Any]:
+    """Verify service principal has required permissions for Genie."""
+    results = {
+        'authenticated_user': None,
+        'genie_space_accessible': False,
+        'genie_space_details': None,
+        'warehouses_accessible': False,
+        'warehouse_count': 0,
+        'errors': []
+    }
+
+    # 1. Check authenticated identity
+    try:
+        current_user = workspace_client.current_user.me()
+        results['authenticated_user'] = {
+            'user_name': getattr(current_user, 'user_name', None),
+            'display_name': getattr(current_user, 'display_name', None),
+            'id': getattr(current_user, 'id', None),
+            'active': getattr(current_user, 'active', None)
+        }
+    except Exception as e:
+        results['errors'].append(f"Failed to get current user: {e}")
+
+    # 2. Check Genie space access
+    try:
+        space = workspace_client.genie.get_space(space_id=space_id)
+        results['genie_space_accessible'] = True
+        results['genie_space_details'] = {
+            'id': getattr(space, 'id', None),
+            'title': getattr(space, 'title', None)
+        }
+    except Exception as e:
+        results['errors'].append(f"Failed to access Genie space {space_id}: {e}")
+
+    # 3. Check warehouse access
+    try:
+        warehouses = list(workspace_client.warehouses.list())
+        results['warehouses_accessible'] = True
+        results['warehouse_count'] = len(warehouses)
+    except Exception as e:
+        results['errors'].append(f"Failed to list warehouses: {e}")
+
+    return results
+
+
+def get_large_result_download_url(workspace_client: WorkspaceClient, space_id: str,
+                                 conversation_id: str, message_id: str,
+                                 attachment_id: str, max_wait: int = 60) -> Optional[str]:
+    """Generate download URL for large query results (>50MB)."""
+    try:
+        # Initiate the download generation
+        workspace_client.genie.generate_download_full_query_result(
+            space_id=space_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            attachment_id=attachment_id
+        )
+
+        # Poll for completion
+        start = time.time()
+        while time.time() - start < max_wait:
+            try:
+                result = workspace_client.genie.get_download_full_query_result(
+                    space_id=space_id,
+                    conversation_id=conversation_id,
+                    message_id=message_id,
+                    attachment_id=attachment_id
+                )
+                if hasattr(result, 'download_url') and result.download_url:
+                    logger.info(f"Generated download URL for attachment {attachment_id}")
+                    return result.download_url
+            except Exception as poll_error:
+                logger.debug(f"Polling for download URL: {poll_error}")
+            time.sleep(2)
+
+        logger.warning(f"Download generation timed out after {max_wait}s for attachment {attachment_id}")
+        return None
+    except Exception as e:
+        logger.error(f"Failed to generate download URL for attachment {attachment_id}: {e}")
+        return None

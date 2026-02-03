@@ -6,6 +6,7 @@ This module contains all Flask routes and API endpoints for the web application.
 
 import time
 import logging
+from functools import wraps
 from flask import Flask, request, jsonify
 
 from .config import Config
@@ -14,6 +15,23 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def require_api_key(f):
+    """Decorator to require API key authentication for endpoints."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        from .utils import bot_state
+        # If no API key is configured, allow access (for backward compatibility)
+        if not bot_state.api_key:
+            return f(*args, **kwargs)
+
+        api_key = request.headers.get('X-API-Key')
+        if not api_key or api_key != bot_state.api_key:
+            logger.warning(f"Unauthorized API access attempt from {request.remote_addr}")
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
 
 # Flask app
 app = Flask(__name__)
@@ -38,6 +56,7 @@ def health_check():
 
 
 @app.route('/api/chat', methods=['POST'])
+@require_api_key
 def chat_endpoint():
     """Direct API endpoint for chat functionality."""
     from .utils import bot_state
@@ -54,7 +73,7 @@ def chat_endpoint():
             return jsonify({'error': 'Databricks client not initialized'}), 500
         
         # Get response from Genie (API endpoint always starts fresh conversations) - using optimized version
-        genie_response, csv_bytes, filename, conversation_id = speak_with_genie_optimized(message, bot_state.workspace_client, None, bot_state)
+        genie_response, csv_bytes, filename, conversation_id, message_id = speak_with_genie_optimized(message, bot_state.workspace_client, None, bot_state)
         
         response_data = {
             'response': genie_response,
@@ -81,6 +100,7 @@ def chat_endpoint():
 
 
 @app.route('/api/status')
+@require_api_key
 def status():
     """Get detailed status of the service with performance metrics."""
     from .utils import bot_state
@@ -109,7 +129,7 @@ def status():
             'processing_users': len(bot_state.processing_users),
             'active_user_queues': active_user_queues,
             'total_queued_messages': total_queued_messages,
-            'note': 'No user-based limits - only workspace QPM limits apply',
+            'note': 'No rate limiting - requests processed immediately',
             'user_queue_details': {
                 user_id: len(queue) for user_id, queue in bot_state.message_queue.items() if queue
             }
@@ -121,15 +141,37 @@ def status():
 
 
 @app.route('/api/performance')
+@require_api_key
 def performance_metrics():
     """Get detailed performance metrics."""
     from .utils import bot_state
     performance_metrics = bot_state.performance_monitor.get_metrics()
-    
+
     return jsonify({
         'system_metrics': performance_metrics,
         'optimizations': {
             'memory_monitoring': True,
             'buffer_optimization': True
         }
+    })
+
+
+@app.route('/api/diagnostics')
+@require_api_key
+def diagnostics():
+    """Check service principal permissions for Genie."""
+    import os
+    from .utils import bot_state
+    from .databricks_client import verify_genie_permissions
+
+    results = verify_genie_permissions(
+        bot_state.workspace_client,
+        bot_state.genie_space_id
+    )
+
+    return jsonify({
+        'service_principal_client_id': os.getenv('DATABRICKS_CLIENT_ID'),
+        'genie_space_id': bot_state.genie_space_id,
+        'databricks_host': bot_state.databricks_host,
+        'permissions': results
     }) 

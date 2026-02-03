@@ -79,27 +79,36 @@ def process_socket_mode_request(client: SocketModeClient, req: SocketModeRequest
         # CRITICAL: Always acknowledge first to prevent message loss
         response = SocketModeResponse(envelope_id=req.envelope_id)
         client.send_socket_mode_response(response)
-        
+
         if req.type == "events_api":
             event = req.payload["event"]
-            
-            # Skip bot messages to prevent loops
+            event_type = event.get("type")
+            logger.info(f"📥 Received event type: {event_type}")
+            logger.debug(f"Event details: {event}")
+
+            # Handle reaction events first (before bot message filtering)
+            if event_type == "reaction_added":
+                logger.info(f"🎯 Received reaction_added event: {event.get('reaction')} from user {event.get('user')}")
+                handle_reaction_event(event, client.web_client, bot_state)
+                return
+
+            # Skip bot messages to prevent loops (only for message events)
             if event.get('bot_id') or event.get('subtype') in ['bot_message', 'me_message']:
                 logger.debug("Ignoring bot message to prevent loops")
                 return
-                
+
             # Skip messages from the bot itself
             user_id = event.get("user", "")
             if bot_state.bot_user_id and user_id == bot_state.bot_user_id:
                 logger.debug("Ignoring message from bot itself")
                 return
-            
+
             # Handle different event types
-            if event.get("type") == "message":
+            if event_type == "message":
                 handle_message_event(event, client.web_client, bot_state)
-            elif event.get("type") == "app_mention":
+            elif event_type == "app_mention":
                 handle_app_mention_event(event, client.web_client, bot_state)
-                
+
     except Exception as e:
         logger.error(f"Error processing Socket Mode request: {e}")
 
@@ -124,14 +133,80 @@ def handle_app_mention_event(event: Dict[str, Any], web_client: WebClient, bot_s
     """Handle app mention events - process mentions in channels and threads."""
     channel_id = event.get("channel", "unknown")
     user_id = event.get("user", "unknown")
-    
+
     logger.info(f"📨 Received app_mention event: channel: {channel_id}, user: {user_id}")
-    
+
     from .utils import add_message_to_queue
     add_message_to_queue(user_id, event,
                        lambda text, thread_ts=None: web_client.chat_postMessage(
                            channel=channel_id, text=text, thread_ts=thread_ts),
                        web_client, bot_state)
+
+
+def handle_reaction_event(event: Dict[str, Any], web_client: WebClient, bot_state):
+    """Handle reaction events for collecting user feedback on Genie responses."""
+    reaction = event.get("reaction", "")
+    item = event.get("item", {})
+    item_ts = item.get("ts", "")
+    channel = item.get("channel", "")
+    user_id = event.get("user", "unknown")
+
+    # Only process thumbs up/down reactions
+    positive_reactions = ["+1", "thumbsup", "white_check_mark", "heavy_check_mark"]
+    negative_reactions = ["-1", "thumbsdown", "x", "heavy_multiplication_x"]
+
+    is_positive = reaction in positive_reactions
+    is_negative = reaction in negative_reactions
+
+    if not is_positive and not is_negative:
+        logger.debug(f"Ignoring non-feedback reaction: {reaction}")
+        return
+
+    logger.info(f"👍 Received feedback reaction '{reaction}' from user {user_id} on message {item_ts}")
+
+    # Look up the Genie message ID for this Slack message
+    from threading import RLock
+    with bot_state.message_id_lock:
+        message_info = bot_state.message_id_tracker.get(item_ts)
+
+    if not message_info:
+        logger.debug(f"No Genie message mapping found for Slack message {item_ts}")
+        return
+
+    conversation_id = message_info.get("conversation_id")
+    message_id = message_info.get("message_id")
+
+    if not conversation_id or not message_id:
+        logger.warning(f"Incomplete message info for {item_ts}: {message_info}")
+        return
+
+    # Send feedback to Genie
+    try:
+        from .databricks_client import send_genie_feedback
+        success = send_genie_feedback(
+            workspace_client=bot_state.workspace_client,
+            space_id=bot_state.genie_space_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            is_positive=is_positive
+        )
+
+        if success:
+            feedback_type = "positive" if is_positive else "negative"
+            logger.info(f"✅ Successfully sent {feedback_type} feedback for message {message_id}")
+
+            # Send confirmation to user by reacting to the original message with 👀
+            try:
+                web_client.reactions_add(
+                    channel=channel,
+                    timestamp=item_ts,
+                    name="eyes"
+                )
+            except Exception as react_err:
+                # Don't fail if we can't add reaction (e.g., already reacted)
+                logger.debug(f"Could not add confirmation reaction: {react_err}")
+    except Exception as e:
+        logger.error(f"Failed to send feedback for message {message_id}: {e}")
 
 
 def get_channel_info(client, channel_id: str) -> Optional[Dict[str, Any]]:

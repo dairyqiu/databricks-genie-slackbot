@@ -16,11 +16,14 @@ A **Databricks Genie Space** is a shared workspace where teams can use AI-powere
 
 ## Key Features
 - Allow users to message Genie Space and get responses back!
-- Query results should return as a CSV file directly inside of your message
+- Query results return as CSV files directly in your message
+- Large query results (>50MB) provide a download link
 - Messages within a single thread are tracked as a distinct "conversation" in Genie
-- Uses Websockets for connection (I chose this mostly due to enterprise security limitations with allowing HTTP connections into their workspace)
-- **Performance Optimized**: Implements Databricks Genie API best practices with rate limiting, exponential backoff, and optimized polling
-- **Concurrent Processing**: Supports multiple channels and users simultaneously with intelligent queuing
+- **User Feedback**: React with 👍 or 👎 to rate Genie responses (sent back to Databricks)
+- **Secure API Endpoints**: Optional API key authentication for `/api/chat`, `/api/status`, `/api/performance`
+- Uses WebSockets for connection (Socket Mode - no inbound HTTP required)
+- **Performance Optimized**: Implements Databricks Genie API best practices with exponential backoff and SDK waiters
+- **Concurrent Processing**: Supports multiple channels and users simultaneously
 - **Resource Efficient**: Optimized for serverless environments (2 vCPU, 6GB RAM)
 
 ## Limitations
@@ -71,7 +74,9 @@ git clone https://github.com/dairyqiu/databricks-genie-slackbot.git
                 "files:write",
                 "im:history",
                 "im:read",
-                "im:write"
+                "im:write",
+                "reactions:read",
+                "reactions:write"
             ]
         }
     },
@@ -79,7 +84,8 @@ git clone https://github.com/dairyqiu/databricks-genie-slackbot.git
         "event_subscriptions": {
             "bot_events": [
                 "app_mention",
-                "message.im"
+                "message.im",
+                "reaction_added"
             ]
         },
         "interactivity": {
@@ -98,6 +104,40 @@ git clone https://github.com/dairyqiu/databricks-genie-slackbot.git
 7. Finally, under **Basic Information**, scroll to **App-Level Tokens** and click **Generate Token and Scopes**. Name it whatever you want, add the "connections:write:" scope, and generate your token. This is your SLACK_APP_TOKEN and should start with  "xapp-". Save this for later as well.
 
 ## Deploying to Databricks Apps
+
+### Required Databricks Permissions
+
+Before deploying, ensure your Databricks Apps service principal has the following permissions:
+
+#### 1. Genie Space Access
+The service principal needs **"Can View"** or **"Can Edit"** permission on your Genie space:
+- Navigate to your Genie space in Databricks
+- Click the **Share** button
+- Add your service principal with appropriate access level
+
+#### 2. SQL Warehouse Access
+The Genie space uses a SQL warehouse to execute queries. The service principal needs **"Can Use"** permission:
+- Go to **SQL Warehouses** in Databricks
+- Select the warehouse used by your Genie space
+- Under **Permissions**, add your service principal with **"Can Use"**
+
+#### 3. Unity Catalog Permissions
+Grant the service principal access to the underlying data:
+
+```sql
+-- Replace with your service principal ID and catalog/schema names
+GRANT USE CATALOG ON CATALOG your_catalog TO `your-service-principal-id`;
+GRANT USE SCHEMA ON SCHEMA your_catalog.your_schema TO `your-service-principal-id`;
+GRANT SELECT ON SCHEMA your_catalog.your_schema TO `your-service-principal-id`;
+```
+
+You can find your service principal ID in **Workspace Settings > Identity and access > Service principals**.
+
+> **Note:** Without these permissions, you'll see errors like "You need 'Can View' permission to perform this action."
+
+---
+
+### Setup Steps
 
 1. We first need to put your SLACK_APP_TOKEN and SLACK_BOT_TOKEN into Databricks Secrets (which you should always use for security reasons or whatever).
 
@@ -148,6 +188,14 @@ env:
   - name: "SHOW_SQL_QUERY"
     value: "true" # set to "false" if you don't want to expose SQL queries to end users
 ```
+
+**Optional:** To secure the API endpoints (`/api/chat`, `/api/status`, `/api/performance`), add an API key to your secrets:
+
+```
+databricks secrets put-secret <scope-name> API_KEY
+```
+
+Requests to these endpoints will then require the `X-API-Key` header.
 
 #### Create your Databricks App
 
@@ -202,6 +250,17 @@ cd slackbot && python app.py
 ## Usage
 
 In Slack, you can either directly talk to your Slackbot under Apps (at the very bottom in the left sidebar), or mention (@) it in a channel (after adding it to the channel).
+
+### Providing Feedback
+
+After each Genie response, you can provide feedback to help improve the AI:
+
+- React with :+1: (thumbs up) to indicate a helpful response
+- React with :-1: (thumbs down) to indicate an unhelpful response
+
+The bot will confirm your feedback was received by adding an :eyes: reaction. This feedback is sent directly to Databricks Genie to help improve response quality over time.
+
+**Note:** For feedback to work, your Slack app must be subscribed to the `reaction_added` event (included in the manifest above).
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
